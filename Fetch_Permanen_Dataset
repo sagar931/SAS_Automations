@@ -1,0 +1,310 @@
+/*
+------------------------------------------------------------------------------------
+Developer: Sagar Mandal
+Created Date: 06APR2025
+------------------------------------------------------------------------------------
+Executive Summary:
+This macro scans one or more SAS/SQL/TXT code files to identify permanent SAS 
+datasets that are created using DATA steps or PROC SQL blocks. It can handle both 
+individual files and entire directories and produces a detailed report showing:
+	•	Dataset name
+	•	Source file name
+	•	Line number in code
+	•	Block type (DATA or PROC SQL)
+	•	Context (e.g., inside a macro)
+------------------------------------------------------------------------------------	
+🧪 How to Run:
+%scan_permanent_datasets(path=/home/u63705630/ingestion_samples);
+	•	Replace the path= argument with:
+	•	A file path: To scan a single file
+	•	A folder path: To scan all .sas, .sql, and .txt files in that folder
+	•	The output dataset will be stored in WORK under the default name scan_results unless out= is customized.
+------------------------------------------------------------------------------------*/
+
+%macro scan_permanent_datasets(path=, out=scan_results);
+	%local isFolder filepath fileList file curFile i;
+	%let _ext = %lowcase(%scan(&path., -1, .));
+%put value of _ext is &_ext.;
+
+	%if %index(sas sql txt, &_ext) > 0 %then
+		%let isFolder = 0;
+	%else
+		%let isFolder = 1;
+
+	/* Initialize output */
+    
+	data &out.;
+		length code_file $256 id 8 dataset $100 line_num 8 block_type $10 context $50;
+		stop;
+	run;
+
+	%if &isFolder=0 %then
+		%do;
+			%let filepath = &path.;
+			%put NOTE: Scanning single file: &filepath.;
+			%local code_file;
+			%let code_file = %scan(&filepath., -1, /);
+
+			/* INLINE: Run the core logic */
+        %scan_file(filepath=&filepath., out=&out.);
+		%end;
+	%else
+		%do;
+			%let dirref = mydir;
+			filename &dirref "&path.";
+
+			data _file_list;
+				length memname $256 filepath $300;
+				did=dopen("&dirref");
+
+				if did > 0 then
+					do;
+						nfiles=dnum(did);
+
+						do i=1 to nfiles;
+							memname=dread(did, i);
+
+							if lowcase(scan(memname, -1, '.')) in ('sas', 'sql', 'txt') then
+								do;
+									filepath=cats("&path./", memname);
+									output;
+								end;
+						end;
+						rc=dclose(did);
+					end;
+				drop i did rc nfiles memname;
+			run;
+
+			proc sql noprint;
+				select filepath into :fileList separated by '|' from _file_list;
+			quit;
+
+			%let i = 1;
+			%let curFile = %scan(&fileList., &i., |);
+
+			%do %while(%length(&curFile.));
+				%put NOTE: Scanning file: &curFile.;
+				%scan_file(filepath=&curFile., out=&out.);
+				%let i = %eval(&i. + 1);
+				%let curFile = %scan(&fileList., &i., |);
+			%end;
+		%end;
+
+	/* Final deduped, sorted report */
+	proc sort data=&out. nodupkey;
+		by code_file line_num dataset;
+	run;
+
+	data &out.;
+		set &out.;
+/* 		row_num + 1; */
+		id + 1;
+	run;
+
+	title "📦 Permanent Datasets Created in &path.";
+
+	proc report data=&out. nowd split='*';
+		columns code_file id dataset line_num block_type context;
+		
+		define code_file / "CODE" width=25 order;
+/* 		define row_num / "No." width=4; */
+		/* <-- Required for BREAK */
+		define id / "ID" width=4;
+		
+		define dataset / "Dataset Name" width=30;
+		define line_num / "Line No." width=8;
+		define block_type / "Block Type" width=12;
+		define context / "Comment" width=30;
+		break after code_file / skip;
+	run;
+
+%mend;
+
+%macro scan_file(filepath=, out=);
+	/* Step 1: Read the file */
+	data raw_code;
+		infile "&filepath." truncover lrecl=32767;
+		input raw_line $char32767.;
+		line_num + 1;
+	run;
+
+	/* Step 2: Clean comments */
+	data clean_code;
+		set raw_code;
+		length code $32767 temp $32767;
+		retain in_comment 0;
+		temp=raw_line;
+
+		if index(temp, '/*') > 0 and index(temp, '*/') > index(temp, '/*') then
+			temp=prxchange('s%/\*.*?\*/%%', -1, temp);
+		else if index(temp, '/*') > 0 then
+			do;
+				temp=substr(temp, 1, index(temp, '/*') - 1);
+				in_comment=1;
+			end;
+
+		if in_comment then
+			do;
+
+				if index(temp, '*/') > 0 then
+					do;
+						temp=substr(temp, index(temp, '*/') + 2);
+						in_comment=0;
+					end;
+				else
+					temp='';
+			end;
+
+		if prxmatch('/^\s*\*/', temp) then
+			temp='';
+
+		if prxmatch('/^\s*\/\//', temp) then
+			temp='';
+		code=strip(temp);
+
+		if code ^='';
+	run;
+
+	/* Step 3: Merge blocks */
+	data merged_blocks;
+		set clean_code;
+		length combined $32000 block_type $10;
+		retain combined '' block_type '' in_data 0 in_sql 0 start_line 0 in_macro 0;
+
+		if index(upcase(code), '%MACRO') then
+			in_macro=1;
+
+		if index(upcase(code), '%MEND') then
+			in_macro=0;
+
+		if prxmatch('/^\s*data\b/i', code) then
+			do;
+				combined=code;
+				block_type='DATA';
+				start_line=line_num;
+				in_data=1;
+			end;
+		else if in_data then
+			do;
+				combined=catx(' ', combined, code);
+
+				if index(code, ';') then
+					do;
+						output;
+						in_data=0;
+					end;
+			end;
+
+		if prxmatch('/\bcreate\s+table\b/i', code) then
+			do;
+				combined=code;
+				block_type='PROC SQL';
+				start_line=line_num;
+				in_sql=1;
+			end;
+		else if in_sql then
+			do;
+				combined=catx(' ', combined, code);
+
+				if index(code, ';') then
+					do;
+						output;
+						in_sql=0;
+					end;
+			end;
+
+		if _n_=_N_ then
+			do;
+
+				if in_data then
+					output;
+
+				if in_sql then
+					output;
+			end;
+		keep combined start_line block_type in_macro;
+	run;
+
+	/* Step 4A: Extract from merged blocks */
+/* Step 4A: Extract from merged blocks */
+data final_output;
+    set merged_blocks;
+    length dataset $100 context $50;
+    retain id 0;
+
+    /* Only parse datasets after 'CREATE TABLE' or 'DATA' */
+    if block_type = 'PROC SQL' then do;
+        if prxmatch('/create\s+table\s+([A-Za-z_]\w*\.[A-Za-z_]\w*)/i', combined) then do;
+            dataset = prxchange('s/.*create\s+table\s+([A-Za-z_]\w*\.[A-Za-z_]\w*).*/\1/i', -1, combined);
+            id + 1;
+            line_num = start_line;
+            context = ifc(in_macro, 'Inside Macro', '');
+            output;
+        end;
+    end;
+    else if block_type = 'DATA' then do;
+        regex = prxparse('/\b(?!WORK\.|_NULL_)([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b/');
+        start=1;
+        call prxnext(regex, start, length(combined), combined, position, len);
+        do while (position > 0);
+            dataset = strip(substr(combined, position, len));
+            id + 1;
+            line_num = start_line;
+            context = ifc(in_macro, 'Inside Macro', '');
+            output;
+            call prxnext(regex, start, length(combined), combined, position, len);
+        end;
+    end;
+
+    keep id dataset line_num block_type context;
+run;
+
+	/* Step 4B: Backup scan */
+	data direct_data_catch;
+		set clean_code;
+		length dataset $100 context $50 combined $32000 block_type $10;
+		retain id 0;
+
+		if prxmatch('/^\s*data\s+/i', code) and index(code, ';') then
+			do;
+				block_type='DATA';
+				combined=code;
+				regex=prxparse('/\b(?!WORK\.|_NULL_)([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b/i');
+				start=1;
+				call prxnext(regex, start, length(combined), combined, position, len);
+
+				do while (position > 0);
+					dataset=strip(substr(combined, position, len));
+					line_num=line_num;
+					context='';
+					output;
+					call prxnext(regex, start, length(combined), combined, position, len);
+				end;
+			end;
+		keep dataset line_num block_type context;
+	run;
+
+	/* Step 4C: Merge */
+	proc sql;
+		create table full_final_output as select * from final_output union corr 
+			select distinct . as id, dataset, line_num, block_type, context from 
+			direct_data_catch where not exists (select 1 from final_output where 
+			final_output.dataset=direct_data_catch.dataset and 
+			final_output.line_num=direct_data_catch.line_num);
+	quit;
+
+	/* Append to out= with code_file */
+	data temp_out;
+		set full_final_output;
+		length code_file $256;
+		code_file=scan("&filepath.", -1, '/');
+         /*  TO SEE WORK LIBS AS WELL, COMMENT BELOW */
+		if upcase(scan(dataset,1,'.')) EQ 'WORK' then delete; 
+	run;
+
+	proc append base=&out. data=temp_out force;
+	run;
+
+%mend;
+
+%scan_permanent_datasets(path=/home/u63705630/ingestion_samples);
