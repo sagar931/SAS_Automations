@@ -43,6 +43,13 @@
 *  CREATED:    %sysfunc(today(), worddate.)
 *  VERSION:    1.0
 ******************************************************************************************/
+%macro truncate_name(name);
+    %if %length(&name) > 32 %then %do;
+        %put WARNING: Dataset name "&name" exceeds 32 characters. Truncating!;
+        %substr(&name, 1, 32)
+    %end;
+    %else &name;
+%mend;
 
 %macro compare_datasets(base=, compare=);
 	/*
@@ -115,7 +122,7 @@
 		%let vtype = &&type&i;
 		%put >>> Comparing variable: &var;
 
-		data comp_&var;
+		data %truncate_name(comp_&var);
 			merge base_sorted(in=a keep=_rownum &var rename=(&var=base_&var)) 
 				compare_sorted(in=b keep=_rownum &var rename=(&var=comp_&var));
 			by _rownum;
@@ -140,7 +147,7 @@
 				result='Mismatch';
 		run;
 
-		data mismatch_sample_&var;
+		data %truncate_name(mismatch_sample_&var);
 			set comp_&var;
 			where result="Mismatch";
 			keep _rownum base_&var comp_&var result;
@@ -162,16 +169,25 @@
 				call symputx('_pct', put(&_match / &_total * 100, 6.2));
 		run;
 
-		data comp_summary;
-			set comp_summary;
-			Variable="&var";
-			Type="%sysfunc(ifc(&vtype=1, Numeric, Character))";
-			Match_Count=&_match;
-			Mismatch_Count=&_mismatch;
-			Total_Obs=&_total;
-			Match_Pct=&_pct;
-			output;
-		run;
+data comp_summary;
+    set comp_summary end=eof;   /* Bring existing rows */
+    output;
+
+    if eof then do;             /* Only add new variable after all old rows output */
+        Variable="&var";
+        Type="%sysfunc(ifc(&vtype=1, Numeric, Character))";
+        Match_Count=&_match;
+        Mismatch_Count=&_mismatch;
+        Total_Obs=&_total;
+        Match_Pct=&_pct;
+        output;
+    end;
+run;
+
+data comp_summary;
+    set comp_summary;
+    if missing(Variable) then delete;
+run;
 
 		%let total_match = %eval(&total_match + &_match);
 		%let total_obs = %eval(&total_obs + &_total);
@@ -251,13 +267,13 @@
     %let var = &&var&i;
 
     proc sql noprint;
-        select count(*) into :_has_mismatch from mismatch_sample_&var;
+        select count(*) into :_has_mismatch from %truncate_name(mismatch_sample_&var);
     quit;
 
     %if &_has_mismatch > 0 %then %do;
         title "🔍 Top Mismatches for Variable: &var";
 
-        proc print data=mismatch_sample_&var noobs 
+        proc print data=%truncate_name(mismatch_sample_&var) noobs 
             label 
             style(header)={background=#444444 foreground=white font_weight=bold}
             style(data)={background=#FFFDFD};
